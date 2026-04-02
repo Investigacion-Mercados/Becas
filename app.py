@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.neighbors import KernelDensity
 
 from analytics import (
     WEEK_SEGMENTS,
@@ -14,7 +16,10 @@ from analytics import (
     rank_actions,
     rank_combinations,
 )
-from db.propensity_repository import get_propensity_socioeconomic_features
+from db.propensity_repository import (
+    get_beneficio_vigencias,
+    get_propensity_socioeconomic_features,
+)
 from db.sql_config import SQL_DATABASE, SQL_SCHEMA, SQL_SERVER
 from db.sql_streamlit import read_table_cached
 
@@ -85,7 +90,7 @@ def inject_styles() -> None:
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def load_base_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_base_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     modelo_df = read_table_cached(
         TABLES["modelo"],
         order_by="identificacion, opportunity_id",
@@ -95,7 +100,8 @@ def load_base_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         order_by="identificacion, opportunity_id, fecha_referencia, beneficio_nombre",
     )
     socioeconomic_df = get_propensity_socioeconomic_features()
-    return modelo_df, beneficio_df, socioeconomic_df
+    vigencias_df = get_beneficio_vigencias()
+    return modelo_df, beneficio_df, socioeconomic_df, vigencias_df
 
 
 def render_header() -> None:
@@ -220,6 +226,98 @@ def build_heatmap(
         )
         .properties(height=height)
     )
+
+
+def build_group_density_chart(
+    dataframe: pd.DataFrame,
+    value_field: str,
+    x_title: str,
+    group_field: str = "grupo_tratamiento",
+    height: int = 320,
+    reference_dates: list[pd.Timestamp] | None = None,
+) -> alt.Chart | None:
+    chart_data = dataframe[[value_field, group_field]].dropna().copy()
+    if chart_data.empty or chart_data[group_field].nunique() < 2:
+        return None
+
+    chart_data[value_field] = pd.to_datetime(chart_data[value_field], errors="coerce")
+    chart_data = chart_data.dropna(subset=[value_field]).copy()
+    if chart_data.empty or chart_data[group_field].nunique() < 2:
+        return None
+
+    min_date = chart_data[value_field].min()
+    max_date = chart_data[value_field].max()
+    if pd.isna(min_date) or pd.isna(max_date) or min_date == max_date:
+        return None
+
+    date_range_days = max(1.0, (max_date - min_date).days)
+    bandwidth_days = max(3.0, min(12.0, date_range_days / 10.0))
+    grid = pd.date_range(min_date, max_date, periods=200)
+    grid_days = ((grid - pd.Timestamp("1970-01-01")) / pd.Timedelta(days=1)).to_numpy().reshape(-1, 1)
+
+    density_frames: list[pd.DataFrame] = []
+    for group_name, group_df in chart_data.groupby(group_field):
+        days = (
+            (group_df[value_field] - pd.Timestamp("1970-01-01")) / pd.Timedelta(days=1)
+        ).to_numpy().reshape(-1, 1)
+        if len(np.unique(days)) < 2:
+            continue
+        kde = KernelDensity(kernel="gaussian", bandwidth=bandwidth_days)
+        kde.fit(days)
+        density = np.exp(kde.score_samples(grid_days))
+        density_frames.append(
+            pd.DataFrame(
+                {
+                    value_field: grid,
+                    "densidad": density,
+                    group_field: group_name,
+                }
+            )
+        )
+
+    if not density_frames:
+        return None
+
+    density_df = pd.concat(density_frames, ignore_index=True)
+    area = alt.Chart(density_df).mark_area(opacity=0.42).encode(
+        x=alt.X(f"{value_field}:T", title=x_title),
+        y=alt.Y("densidad:Q", title="Frecuencia relativa"),
+        color=alt.Color(
+            f"{group_field}:N",
+            title="Grupo",
+            scale=alt.Scale(domain=["Control", "Tratado"], range=["#e9a3a3", "#69d0d0"]),
+        ),
+        tooltip=[
+            alt.Tooltip(f"{group_field}:N", title="Grupo"),
+            alt.Tooltip(f"{value_field}:T", title=x_title),
+            alt.Tooltip("densidad:Q", title="Densidad", format=".3f"),
+        ],
+    )
+    line = alt.Chart(density_df).mark_line(strokeWidth=2).encode(
+        x=alt.X(f"{value_field}:T", title=x_title),
+        y=alt.Y("densidad:Q", title="Frecuencia relativa"),
+        color=alt.Color(
+            f"{group_field}:N",
+            title="Grupo",
+            scale=alt.Scale(domain=["Control", "Tratado"], range=["#4f4f4f", "#1b6f6f"]),
+            legend=None,
+        ),
+    )
+    layers: list[alt.Chart] = [area, line]
+
+    valid_reference_dates = [
+        pd.to_datetime(value, errors="coerce")
+        for value in (reference_dates or [])
+    ]
+    valid_reference_dates = [value for value in valid_reference_dates if pd.notna(value)]
+    if valid_reference_dates:
+        rule_df = pd.DataFrame({value_field: valid_reference_dates})
+        rules = alt.Chart(rule_df).mark_rule(color="black", strokeWidth=2).encode(
+            x=alt.X(f"{value_field}:T")
+        )
+        layers.append(rules)
+
+    return alt.layer(*layers).properties(height=height)
 
 
 def sidebar_filters(modelo_df: pd.DataFrame) -> dict[str, object]:
@@ -797,6 +895,7 @@ def render_drilldown_tab(
     modelo_df: pd.DataFrame,
     beneficio_df: pd.DataFrame,
     socioeconomic_df: pd.DataFrame,
+    vigencias_df: pd.DataFrame,
     general_ranking: pd.DataFrame,
     config: dict[str, object],
 ) -> None:
@@ -856,6 +955,15 @@ def render_drilldown_tab(
     score_band_df = build_score_band_summary(result.model_df, outcome_column="resultado")
     outcome_label = str(config["outcome_label"])
     treatment_flag = str(config["treatment_flag"])
+    benefit_start_dates = (
+        vigencias_df.loc[vigencias_df["beneficio_nombre"] == benefit_name, "fecha_inicio"]
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+        if not vigencias_df.empty
+        else []
+    )
 
     metrics = result.summary_metrics
     cols = st.columns(4)
@@ -917,6 +1025,23 @@ def render_drilldown_tab(
     with tab_b:
         st.subheader("Distribucion de propensity score")
         st.altair_chart(build_histogram(result.model_df), use_container_width=True)
+
+        st.subheader("Distribucion temporal de control y tratamiento")
+        density_chart = build_group_density_chart(
+            result.model_df,
+            value_field="fecha_inicio_proceso",
+            x_title="Fecha de inicio del proceso",
+            reference_dates=benefit_start_dates,
+        )
+        if density_chart is None:
+            st.info("No hubo variacion suficiente en fechas para dibujar la densidad de control vs tratado.")
+        else:
+            st.altair_chart(density_chart, use_container_width=True)
+            if benefit_start_dates:
+                st.caption("La linea negra marca el inicio de vigencia del beneficio seleccionado. Si el beneficio tiene varias vigencias, se muestra una linea por cada inicio.")
+            else:
+                st.caption("No se encontraron vigencias cargadas para el beneficio seleccionado.")
+
         st.subheader("Resultado por banda de score")
         if score_band_df.empty:
             st.info("No hubo suficiente variacion en el score para construir bandas.")
@@ -976,7 +1101,7 @@ def main() -> None:
     render_header()
 
     try:
-        modelo_df, beneficio_df, socioeconomic_df = load_base_data()
+        modelo_df, beneficio_df, socioeconomic_df, vigencias_df = load_base_data()
     except Exception as exc:
         st.error(f"No se pudo leer SQL Server: {exc}")
         st.stop()
@@ -1066,6 +1191,7 @@ def main() -> None:
             modelo_df=modelo_df,
             beneficio_df=beneficio_df,
             socioeconomic_df=socioeconomic_df,
+            vigencias_df=vigencias_df,
             general_ranking=general_ranking,
             config=config,
         )

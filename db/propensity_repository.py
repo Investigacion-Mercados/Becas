@@ -18,6 +18,21 @@ ORDER BY beneficio_nombre;
 """
 
 
+BENEFICIO_VIGENCIAS_QUERY = """
+SELECT
+    CAST(bc.nombre_beneficio AS nvarchar(150)) AS beneficio_nombre,
+    CAST(bv.fecha_inicio AS date) AS fecha_inicio,
+    CAST(bv.fecha_fin AS date) AS fecha_fin
+FROM [salesforce].[beneficio_vigencia] bv
+INNER JOIN [salesforce].[beneficio_catalogo] bc
+    ON bc.beneficio_id = bv.beneficio_id
+ORDER BY
+    bc.nombre_beneficio,
+    bv.fecha_inicio,
+    bv.fecha_fin;
+"""
+
+
 PROPENSITY_SOCIOECONOMIC_QUERY = """
 WITH cohorte AS (
     SELECT DISTINCT
@@ -258,6 +273,10 @@ def get_ps_oportunidad_modelo(
 
 def get_beneficios_resumen(engine: Engine | None = None) -> pd.DataFrame:
     return read_sql_df(BENEFICIOS_RESUMEN_QUERY, engine=engine)
+
+
+def get_beneficio_vigencias(engine: Engine | None = None) -> pd.DataFrame:
+    return read_sql_df(BENEFICIO_VIGENCIAS_QUERY, engine=engine)
 
 
 def get_propensity_socioeconomic_features(engine: Engine | None = None) -> pd.DataFrame:
